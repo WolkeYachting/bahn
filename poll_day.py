@@ -75,17 +75,48 @@ def save_day_log(log: dict, commit_message: str) -> None:
     )
 
 
+def _get_with_retry(url: str, max_retries: int = 3, backoff_seconds: float = 2.0):
+    """GET with retry on 5xx errors. The Bahn API is occasionally flaky."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
+            if r.status_code >= 500 and attempt < max_retries - 1:
+                print(f"[api] {r.status_code} on attempt {attempt+1}, retrying...", file=sys.stderr)
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r
+        except requests.HTTPError as e:
+            last_exc = e
+            status = e.response.status_code if e.response is not None else None
+            if status and status >= 500 and attempt < max_retries - 1:
+                print(f"[api] HTTPError {status} on attempt {attempt+1}, retrying...", file=sys.stderr)
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            raise
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                print(f"[api] {type(e).__name__} on attempt {attempt+1}, retrying...", file=sys.stderr)
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+
+
 def fetch_departures(station_id: str, products: dict, duration_minutes: int) -> list:
     params = {
         "duration": duration_minutes,
         "results": 1000,
         "remarks": "false",
+        "profile": "db",  # The 'db' profile consistently returns more trips
     }
     for product, enabled in products.items():
         params[product] = "true" if enabled else "false"
     url = f"{API}/stops/{station_id}/departures?{urlencode(params)}"
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
-    r.raise_for_status()
+    r = _get_with_retry(url)
     data = r.json()
     if isinstance(data, dict) and "departures" in data:
         return data["departures"]
@@ -93,14 +124,16 @@ def fetch_departures(station_id: str, products: dict, duration_minutes: int) -> 
 
 
 def fetch_trip(trip_id: str) -> dict | None:
-    url = f"{API}/trips/{quote(trip_id, safe='')}"
+    url = f"{API}/trips/{quote(trip_id, safe='')}?profile=db"
     try:
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
+        r = _get_with_retry(url)
         body = r.json()
         return body.get("trip") or body
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return None
+        print(f"[trip] fetch failed for {trip_id[:50]}...: {e}", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"[trip] fetch failed for {trip_id[:50]}...: {e}", file=sys.stderr)
         return None
@@ -211,10 +244,11 @@ def poll_once() -> dict:
         "days_touched": [],
     }
 
-    # 1. Fetch departures (24h window covers the next day's early trains too)
+    # 1. Fetch departures. The API silently caps 'duration' at ~60 min
+    #    regardless of what we pass, so we just ask for 60.
     try:
         departures = fetch_departures(
-            station_id, config["products"], duration_minutes=24 * 60
+            station_id, config["products"], duration_minutes=60
         )
     except Exception as e:
         stats["error"] = f"departures fetch failed: {e}"
