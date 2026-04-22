@@ -5,7 +5,7 @@ Endpoints triggered by cron-job.org:
   GET /analyze     analyze yesterday's logical day (once daily ~9:00 Berlin)
 
 Both can be guarded by ?token=... when CRON_TOKEN env var is set.
-Comment
+
 Other endpoints:
   GET  /            human-readable status page
   GET  /excel       download latest Excel
