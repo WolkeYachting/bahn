@@ -403,89 +403,130 @@ def debug_profile_test():
 
 @app.get("/debug/journeys")
 def debug_journeys():
-    """Query /journeys?from=...&to=...&routingMode=HYBRID.
+    """Query /journeys with multiple parameter combinations to find what works.
 
-    The HYBRID mode is documented to include cancelled journeys. If it does,
-    we have a way to see full cancellations.
+    Tries different combinations of routingMode, transfers, profile, and
+    departure time, so we can pinpoint which settings produce results and
+    whether HYBRID actually surfaces cancellations.
 
     Query params:
-      from        - station id (required)
-      to          - station id (required)
-      departure   - ISO datetime (optional; defaults to now)
-      results     - default 20
-      routingMode - default HYBRID
+      from      - station id (required)
+      to        - station id (required)
+      departure - ISO datetime; default: tomorrow 08:00 local
     """
     err = _require_cron_token()
     if err is not None:
         return err
     import requests as _req
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        from zoneinfo import ZoneInfo
+        berlin = ZoneInfo("Europe/Berlin")
+    except Exception:
+        berlin = None
 
     from_id = request.args.get("from")
     to_id = request.args.get("to")
     if not from_id or not to_id:
         return jsonify({"error": "Missing from or to parameter"}), 400
 
-    params = {
+    # Default to tomorrow 08:00 Berlin time so we don't hit the nighttime lull
+    departure = request.args.get("departure")
+    if not departure:
+        now = _dt.now(berlin) if berlin else _dt.now()
+        tmrw_8 = (now.replace(hour=8, minute=0, second=0, microsecond=0)
+                  + _td(days=1))
+        departure = tmrw_8.isoformat()
+
+    variants = [
+        {"label": "default (REALTIME)", "routingMode": None,
+         "transfers": None, "profile": None},
+        {"label": "HYBRID only", "routingMode": "HYBRID",
+         "transfers": None, "profile": None},
+        {"label": "HYBRID + transfers=0", "routingMode": "HYBRID",
+         "transfers": 0, "profile": None},
+        {"label": "profile=db", "routingMode": None,
+         "transfers": None, "profile": "db"},
+        {"label": "profile=db + HYBRID", "routingMode": "HYBRID",
+         "transfers": None, "profile": "db"},
+        {"label": "profile=db + HYBRID + transfers=0", "routingMode": "HYBRID",
+         "transfers": 0, "profile": "db"},
+    ]
+
+    results = []
+    for v in variants:
+        params = {
+            "from": from_id,
+            "to": to_id,
+            "results": 10,
+            "departure": departure,
+            "stopovers": "false",
+            "remarks": "false",
+        }
+        if v["routingMode"]:
+            params["routingMode"] = v["routingMode"]
+        if v["transfers"] is not None:
+            params["transfers"] = v["transfers"]
+        if v["profile"]:
+            params["profile"] = v["profile"]
+
+        try:
+            r = _req.get(
+                "https://v6.db.transport.rest/journeys",
+                params=params,
+                headers={"User-Agent": "bahn-pb/1.0"},
+                timeout=30,
+            )
+            status = r.status_code
+            if status == 200:
+                body = r.json()
+                journeys = body.get("journeys") or []
+                # Count legs total, cancelled, direct (1 leg only)
+                total_legs = 0
+                cancelled_legs = 0
+                direct_journeys = 0
+                sample = []
+                for j in journeys:
+                    legs = [l for l in (j.get("legs") or [])
+                            if not l.get("walking")]
+                    total_legs += len(legs)
+                    if len(legs) == 1:
+                        direct_journeys += 1
+                    for l in legs:
+                        if l.get("cancelled"):
+                            cancelled_legs += 1
+                        if len(sample) < 3:
+                            line = l.get("line") or {}
+                            sample.append({
+                                "line": line.get("name"),
+                                "planned_departure": l.get("plannedDeparture"),
+                                "planned_arrival": l.get("plannedArrival"),
+                                "cancelled": bool(l.get("cancelled")),
+                                "legs_in_journey": len(legs),
+                            })
+                results.append({
+                    "variant": v["label"],
+                    "status": 200,
+                    "journeys_returned": len(journeys),
+                    "direct_journeys": direct_journeys,
+                    "total_legs": total_legs,
+                    "cancelled_legs": cancelled_legs,
+                    "sample": sample,
+                })
+            else:
+                results.append({
+                    "variant": v["label"],
+                    "status": status,
+                    "body_sample": r.text[:200],
+                })
+        except Exception as e:
+            results.append({"variant": v["label"], "error": str(e)})
+
+    return jsonify({
+        "departure_used": departure,
         "from": from_id,
         "to": to_id,
-        "results": int(request.args.get("results", "20")),
-        "routingMode": request.args.get("routingMode", "HYBRID"),
-        "transfers": 0,  # only direct connections
-        "stopovers": "false",
-        "remarks": "false",
-    }
-    dep = request.args.get("departure")
-    if dep:
-        params["departure"] = dep
-
-    try:
-        r = _req.get(
-            "https://v6.db.transport.rest/journeys",
-            params=params,
-            headers={"User-Agent": "bahn-pb/1.0"},
-            timeout=30,
-        )
-        r.raise_for_status()
-        body = r.json()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
-
-    journeys = body.get("journeys") or []
-    simplified = []
-    cancelled_count = 0
-    for j in journeys:
-        legs = j.get("legs") or []
-        # For direct trains, we expect 1 leg
-        for leg in legs:
-            if leg.get("walking"):
-                continue
-            line = leg.get("line") or {}
-            is_cancelled = bool(leg.get("cancelled"))
-            if is_cancelled:
-                cancelled_count += 1
-            simplified.append({
-                "trip_id": leg.get("tripId"),
-                "line": line.get("name"),
-                "product": line.get("product"),
-                "planned_departure": leg.get("plannedDeparture"),
-                "departure": leg.get("departure"),
-                "departure_delay_min": (
-                    int(leg.get("departureDelay") // 60)
-                    if leg.get("departureDelay") is not None else None
-                ),
-                "planned_arrival": leg.get("plannedArrival"),
-                "arrival": leg.get("arrival"),
-                "arrival_delay_min": (
-                    int(leg.get("arrivalDelay") // 60)
-                    if leg.get("arrivalDelay") is not None else None
-                ),
-                "cancelled": is_cancelled,
-            })
-    return jsonify({
-        "params": params,
-        "total_legs": len(simplified),
-        "cancelled_legs": cancelled_count,
-        "legs": simplified,
+        "results": results,
     })
 
 
