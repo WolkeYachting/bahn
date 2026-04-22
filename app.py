@@ -6,6 +6,10 @@ Endpoints triggered by cron-job.org:
 
 Both can be guarded by ?token=... when CRON_TOKEN env var is set.
 
+Both /poll and /analyze respond immediately with 200 OK and run the actual
+work in a background thread. This avoids cron-job.org timeouts (30s) while
+Render's free tier is waking up from sleep (can take 30-60s).
+
 Other endpoints:
   GET  /            human-readable status page
   GET  /excel       download latest Excel
@@ -15,6 +19,7 @@ Other endpoints:
 
 import json
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +39,52 @@ _storage = Storage()
 
 CRON_TOKEN = os.environ.get("CRON_TOKEN")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+
+
+def _run_in_background(fn, *args, **kwargs):
+    """Start a daemon thread running fn(*args, **kwargs). Errors are logged
+    but do not crash the server."""
+    def _wrapper():
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:
+            import traceback
+            print(f"[background] {fn.__name__} failed: {e}")
+            traceback.print_exc()
+    t = threading.Thread(target=_wrapper, daemon=True)
+    t.start()
+    return t
+
+
+# Locks to prevent overlapping runs of the same job (cron-job.org might fire
+# a second trigger while the previous one is still executing, especially on
+# the first wake-up from Render sleep).
+_poll_lock = threading.Lock()
+_analyze_lock = threading.Lock()
+
+
+def _guarded_poll():
+    if not _poll_lock.acquire(blocking=False):
+        print("[poll] previous run still in progress, skipping")
+        return
+    try:
+        poll_day.poll_once()
+    finally:
+        _poll_lock.release()
+
+
+def _guarded_analyze(date):
+    if not _analyze_lock.acquire(blocking=False):
+        print("[analyze] previous run still in progress, skipping")
+        return
+    try:
+        analyze_day.run(date)
+        try:
+            generate_excel.generate()
+        except Exception as e:
+            print(f"[analyze] excel generation failed: {e}")
+    finally:
+        _analyze_lock.release()
 
 
 def _require_cron_token():
@@ -133,8 +184,12 @@ def poll():
     err = _require_cron_token()
     if err is not None:
         return err
-    stats = poll_day.poll_once()
-    return jsonify(stats)
+    _run_in_background(_guarded_poll)
+    return jsonify({
+        "status": "started",
+        "message": "Poll running in background",
+        "at": datetime.utcnow().isoformat(),
+    })
 
 
 @app.get("/analyze")
@@ -143,12 +198,13 @@ def analyze():
     if err is not None:
         return err
     date = request.args.get("date") or None
-    summary = analyze_day.run(date)
-    try:
-        generate_excel.generate()
-    except Exception as e:
-        summary["excel_error"] = str(e)
-    return jsonify(summary)
+    _run_in_background(_guarded_analyze, date)
+    return jsonify({
+        "status": "started",
+        "message": "Analysis running in background",
+        "date": date or "yesterday",
+        "at": datetime.utcnow().isoformat(),
+    })
 
 
 @app.get("/excel")
