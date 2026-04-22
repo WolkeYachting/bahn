@@ -194,6 +194,80 @@ def health():
     })
 
 
+# ---- Debug endpoints (temporary, for diagnosing API behavior) -------------
+
+@app.get("/debug/durations")
+def debug_durations():
+    """Test how many trips the API returns for different duration values.
+
+    Query params:
+      when  - ISO datetime (optional, defaults to now)
+    """
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    import debug_api
+    config = poll_day.load_config()
+    when = request.args.get("when") or None
+    result = debug_api.test_durations(
+        config["station"]["id"],
+        config["products"],
+        when_iso=when,
+    )
+    return jsonify(result)
+
+
+@app.get("/debug/trip")
+def debug_trip():
+    """Fetch a specific trip and show its real-time data completeness.
+
+    Query params:
+      id  - trip ID (required)
+    """
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    import debug_api
+    trip_id = request.args.get("id")
+    if not trip_id:
+        return jsonify({"error": "Missing id parameter"}), 400
+    return jsonify(debug_api.test_trip_completeness(trip_id))
+
+
+@app.get("/debug/departures")
+def debug_departures():
+    """Show the most recent departures the API returns right now (for picking
+    trip IDs to test /debug/trip with)."""
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    config = poll_day.load_config()
+    station_id = config["station"]["id"]
+    try:
+        deps = poll_day.fetch_departures(
+            station_id, config["products"], duration_minutes=120,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    simplified = []
+    for d in deps[:50]:
+        line = d.get("line") or {}
+        stop = d.get("stop") or {}
+        simplified.append({
+            "trip_id": d.get("tripId"),
+            "line": line.get("name"),
+            "direction": d.get("direction"),
+            "when": d.get("when"),
+            "planned_when": d.get("plannedWhen"),
+            "delay_minutes": (int(d.get("delay") // 60)
+                              if d.get("delay") is not None else None),
+            "platform": d.get("platform"),
+            "station": stop.get("name"),
+        })
+    return jsonify({"count": len(deps), "departures": simplified})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
