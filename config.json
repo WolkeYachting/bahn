@@ -1,0 +1,23 @@
+{
+  "station": {
+    "id": "8000148",
+    "name": "Paderborn Hbf"
+  },
+  "products": {
+    "regional": true,
+    "regionalExpress": true,
+    "suburban": true,
+    "nationalExpress": false,
+    "national": false,
+    "bus": false,
+    "ferry": false,
+    "subway": false,
+    "tram": false
+  },
+  "delay_threshold_minutes": 60,
+  "day_boundary_hour": 3,
+  "day_boundary_minute": 30,
+  "force_finish_hour": 9,
+  "force_finish_grace_minutes": 30,
+  "request_delay_seconds": 1.0
+}

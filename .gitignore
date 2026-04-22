@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Local cache files — written to the data repo, not the code repo
+/incidents.json
+/logs/*.json
+/exports/*.xlsx

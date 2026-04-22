@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: bahn-pb
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 120 --workers 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: CRON_TOKEN
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
+      - key: GITHUB_BRANCH
+        value: main
+      - key: GITHUB_AUTHOR
+        value: bahn-pb-bot
+      - key: GITHUB_EMAIL
+        value: bot@users.noreply.github.com
