@@ -231,7 +231,103 @@ def debug_trip():
     trip_id = request.args.get("id")
     if not trip_id:
         return jsonify({"error": "Missing id parameter"}), 400
-    return jsonify(debug_api.test_trip_completeness(trip_id))
+    # Strip accidental quoting from browser copy-paste
+    trip_id = trip_id.strip().strip('"').strip("'")
+    try:
+        return jsonify(debug_api.test_trip_completeness(trip_id))
+    except Exception as e:
+        return jsonify({"error": str(e), "trip_id": trip_id}), 500
+
+
+@app.get("/debug/lookup")
+def debug_lookup():
+    """Search for stations by name. Returns ID and display name.
+
+    Query params:
+      q  - station name or fragment (required)
+    """
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    import requests as _req
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "Missing q parameter"}), 400
+    try:
+        r = _req.get(
+            "https://v6.db.transport.rest/locations",
+            params={"query": q, "results": 10,
+                    "poi": "false", "addresses": "false"},
+            headers={"User-Agent": "bahn-pb/1.0"},
+            timeout=15,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    out = []
+    for item in r.json() or []:
+        if item.get("type") != "stop":
+            continue
+        prods = item.get("products") or {}
+        out.append({
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "products": sorted([k for k, v in prods.items() if v]),
+        })
+    return jsonify({"query": q, "results": out})
+
+
+@app.get("/debug/arrivals")
+def debug_arrivals():
+    """Show arrivals at a station (the other side of departures).
+
+    Lets us see whether the API still reports arrival data after trains have
+    arrived (crucial: if yes, we can pick up late trips even after-the-fact).
+
+    Query params:
+      id       - station id (required)
+      duration - minutes to look back (default 60)
+    """
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    import requests as _req
+    station_id = request.args.get("id")
+    if not station_id:
+        return jsonify({"error": "Missing id parameter"}), 400
+    try:
+        dur = int(request.args.get("duration", "60"))
+    except ValueError:
+        dur = 60
+
+    try:
+        r = _req.get(
+            f"https://v6.db.transport.rest/stops/{station_id}/arrivals",
+            params={"duration": dur, "results": 100},
+            headers={"User-Agent": "bahn-pb/1.0"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    arrs = body.get("arrivals") if isinstance(body, dict) else body
+    arrs = arrs or []
+    simplified = []
+    for a in arrs[:50]:
+        line = a.get("line") or {}
+        simplified.append({
+            "trip_id": a.get("tripId"),
+            "line": line.get("name"),
+            "origin": a.get("provenance") or (a.get("origin") or {}).get("name"),
+            "planned_when": a.get("plannedWhen"),
+            "when": a.get("when"),
+            "delay_minutes": (int(a.get("delay") // 60)
+                              if a.get("delay") is not None else None),
+            "cancelled": bool(a.get("cancelled")),
+        })
+    return jsonify({"count": len(arrs), "arrivals": simplified})
 
 
 @app.get("/debug/departures")
