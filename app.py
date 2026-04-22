@@ -330,6 +330,249 @@ def debug_arrivals():
     return jsonify({"count": len(arrs), "arrivals": simplified})
 
 
+# ---- Next wave of debug endpoints (profile, journeys/HYBRID, trips) -------
+
+@app.get("/debug/profile_test")
+def debug_profile_test():
+    """Compare what different API 'profile' values return.
+
+    Tries 'dbnav' (default), 'db' (bahn.de backend), 'dbweb'. For each, polls
+    departures with duration=720 and reports how many trips came back and how
+    large the actual time span was.
+    """
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    import requests as _req
+    station_id = request.args.get("id")
+    if not station_id:
+        return jsonify({"error": "Missing id parameter"}), 400
+
+    profiles = ["dbnav", "db", "dbweb"]
+    result = {"station_id": station_id, "results": []}
+
+    for profile in profiles:
+        try:
+            r = _req.get(
+                f"https://v6.db.transport.rest/stops/{station_id}/departures",
+                params={
+                    "duration": 720,
+                    "results": 1000,
+                    "profile": profile,
+                    "remarks": "false",
+                },
+                headers={"User-Agent": "bahn-pb/1.0"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            body = r.json()
+            deps = body.get("departures") if isinstance(body, dict) else body
+            deps = deps or []
+
+            times = [d.get("plannedWhen") for d in deps if d.get("plannedWhen")]
+            times.sort()
+            first, last = (times[0], times[-1]) if times else (None, None)
+            span_min = None
+            if first and last:
+                try:
+                    dt_f = datetime.fromisoformat(first.replace("Z", "+00:00"))
+                    dt_l = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                    span_min = int((dt_l - dt_f).total_seconds() // 60)
+                except Exception:
+                    pass
+
+            cancelled_count = sum(1 for d in deps if d.get("cancelled"))
+
+            result["results"].append({
+                "profile": profile,
+                "trips_returned": len(deps),
+                "unique_trip_ids": len({d.get("tripId") for d in deps
+                                        if d.get("tripId")}),
+                "earliest_when": first,
+                "latest_when": last,
+                "span_minutes": span_min,
+                "cancelled_trips": cancelled_count,
+            })
+        except Exception as e:
+            result["results"].append({
+                "profile": profile,
+                "error": str(e),
+            })
+    return jsonify(result)
+
+
+@app.get("/debug/journeys")
+def debug_journeys():
+    """Query /journeys?from=...&to=...&routingMode=HYBRID.
+
+    The HYBRID mode is documented to include cancelled journeys. If it does,
+    we have a way to see full cancellations.
+
+    Query params:
+      from        - station id (required)
+      to          - station id (required)
+      departure   - ISO datetime (optional; defaults to now)
+      results     - default 20
+      routingMode - default HYBRID
+    """
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    import requests as _req
+
+    from_id = request.args.get("from")
+    to_id = request.args.get("to")
+    if not from_id or not to_id:
+        return jsonify({"error": "Missing from or to parameter"}), 400
+
+    params = {
+        "from": from_id,
+        "to": to_id,
+        "results": int(request.args.get("results", "20")),
+        "routingMode": request.args.get("routingMode", "HYBRID"),
+        "transfers": 0,  # only direct connections
+        "stopovers": "false",
+        "remarks": "false",
+    }
+    dep = request.args.get("departure")
+    if dep:
+        params["departure"] = dep
+
+    try:
+        r = _req.get(
+            "https://v6.db.transport.rest/journeys",
+            params=params,
+            headers={"User-Agent": "bahn-pb/1.0"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    journeys = body.get("journeys") or []
+    simplified = []
+    cancelled_count = 0
+    for j in journeys:
+        legs = j.get("legs") or []
+        # For direct trains, we expect 1 leg
+        for leg in legs:
+            if leg.get("walking"):
+                continue
+            line = leg.get("line") or {}
+            is_cancelled = bool(leg.get("cancelled"))
+            if is_cancelled:
+                cancelled_count += 1
+            simplified.append({
+                "trip_id": leg.get("tripId"),
+                "line": line.get("name"),
+                "product": line.get("product"),
+                "planned_departure": leg.get("plannedDeparture"),
+                "departure": leg.get("departure"),
+                "departure_delay_min": (
+                    int(leg.get("departureDelay") // 60)
+                    if leg.get("departureDelay") is not None else None
+                ),
+                "planned_arrival": leg.get("plannedArrival"),
+                "arrival": leg.get("arrival"),
+                "arrival_delay_min": (
+                    int(leg.get("arrivalDelay") // 60)
+                    if leg.get("arrivalDelay") is not None else None
+                ),
+                "cancelled": is_cancelled,
+            })
+    return jsonify({
+        "params": params,
+        "total_legs": len(simplified),
+        "cancelled_legs": cancelled_count,
+        "legs": simplified,
+    })
+
+
+@app.get("/debug/trips_by_name")
+def debug_trips_by_name():
+    """Try the (undocumented for db-rest) /trips endpoint with 'query' filter.
+
+    This is how the VBB API exposes 'find trips by line name/number'. It may
+    or may not work on the DB profile — this test will tell us.
+
+    Query params:
+      query - line name or fahrtNr (e.g. 'RE11' or '26736')
+      when  - ISO datetime (optional; defaults to now)
+    """
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    import requests as _req
+
+    q = request.args.get("query")
+    if not q:
+        return jsonify({"error": "Missing query parameter"}), 400
+
+    attempts = []
+
+    # Attempt 1: /trips with query
+    try:
+        r = _req.get(
+            "https://v6.db.transport.rest/trips",
+            params={"query": q},
+            headers={"User-Agent": "bahn-pb/1.0"},
+            timeout=30,
+        )
+        attempts.append({
+            "endpoint": "/trips?query=",
+            "status": r.status_code,
+            "body_sample": r.text[:500] if r.status_code != 200 else None,
+            "parsed_count": (
+                len(r.json()) if r.status_code == 200
+                and isinstance(r.json(), list) else None
+            ),
+        })
+    except Exception as e:
+        attempts.append({"endpoint": "/trips?query=",
+                         "error": str(e)})
+
+    # Attempt 2: /trips with lineName
+    try:
+        r = _req.get(
+            "https://v6.db.transport.rest/trips",
+            params={"lineName": q},
+            headers={"User-Agent": "bahn-pb/1.0"},
+            timeout=30,
+        )
+        attempts.append({
+            "endpoint": "/trips?lineName=",
+            "status": r.status_code,
+            "body_sample": r.text[:500] if r.status_code != 200 else None,
+            "parsed_count": (
+                len(r.json()) if r.status_code == 200
+                and isinstance(r.json(), list) else None
+            ),
+        })
+    except Exception as e:
+        attempts.append({"endpoint": "/trips?lineName=",
+                         "error": str(e)})
+
+    # Attempt 3: /lines?query= (if supported, returns line metadata)
+    try:
+        r = _req.get(
+            "https://v6.db.transport.rest/lines",
+            params={"query": q},
+            headers={"User-Agent": "bahn-pb/1.0"},
+            timeout=30,
+        )
+        attempts.append({
+            "endpoint": "/lines?query=",
+            "status": r.status_code,
+            "body_sample": r.text[:500] if r.status_code != 200 else None,
+        })
+    except Exception as e:
+        attempts.append({"endpoint": "/lines?query=",
+                         "error": str(e)})
+
+    return jsonify({"query": q, "attempts": attempts})
+
+
 @app.get("/debug/departures")
 def debug_departures():
     """Show the most recent departures the API returns right now (for picking
