@@ -418,6 +418,7 @@ def debug_journeys():
     if err is not None:
         return err
     import requests as _req
+    import time as _time
     from datetime import datetime as _dt, timedelta as _td
     try:
         from zoneinfo import ZoneInfo
@@ -430,7 +431,6 @@ def debug_journeys():
     if not from_id or not to_id:
         return jsonify({"error": "Missing from or to parameter"}), 400
 
-    # Default to tomorrow 08:00 Berlin time so we don't hit the nighttime lull
     departure = request.args.get("departure")
     if not departure:
         now = _dt.now(berlin) if berlin else _dt.now()
@@ -454,7 +454,11 @@ def debug_journeys():
     ]
 
     results = []
-    for v in variants:
+    for i, v in enumerate(variants):
+        # Rate-limit: 1.5s between calls
+        if i > 0:
+            _time.sleep(1.5)
+
         params = {
             "from": from_id,
             "to": to_id,
@@ -481,10 +485,11 @@ def debug_journeys():
             if status == 200:
                 body = r.json()
                 journeys = body.get("journeys") or []
-                # Count legs total, cancelled, direct (1 leg only)
                 total_legs = 0
                 cancelled_legs = 0
                 direct_journeys = 0
+                products_seen: dict[str, int] = {}
+                lines_seen: dict[str, int] = {}
                 sample = []
                 for j in journeys:
                     legs = [l for l in (j.get("legs") or [])
@@ -493,14 +498,18 @@ def debug_journeys():
                     if len(legs) == 1:
                         direct_journeys += 1
                     for l in legs:
+                        line = l.get("line") or {}
+                        p = line.get("product") or "?"
+                        n = line.get("name") or "?"
+                        products_seen[p] = products_seen.get(p, 0) + 1
+                        lines_seen[n] = lines_seen.get(n, 0) + 1
                         if l.get("cancelled"):
                             cancelled_legs += 1
-                        if len(sample) < 3:
-                            line = l.get("line") or {}
+                        if len(sample) < 5:
                             sample.append({
-                                "line": line.get("name"),
+                                "line": n,
+                                "product": p,
                                 "planned_departure": l.get("plannedDeparture"),
-                                "planned_arrival": l.get("plannedArrival"),
                                 "cancelled": bool(l.get("cancelled")),
                                 "legs_in_journey": len(legs),
                             })
@@ -511,6 +520,8 @@ def debug_journeys():
                     "direct_journeys": direct_journeys,
                     "total_legs": total_legs,
                     "cancelled_legs": cancelled_legs,
+                    "products_seen": products_seen,
+                    "lines_seen": lines_seen,
                     "sample": sample,
                 })
             else:
@@ -527,6 +538,95 @@ def debug_journeys():
         "from": from_id,
         "to": to_id,
         "results": results,
+    })
+
+
+@app.get("/debug/departures_direction")
+def debug_departures_direction():
+    """Query departures from station A with direction=B filter.
+
+    This may be a more reliable way to see 'all direct trains from A toward
+    B', independent of the journey router's opinion about what constitutes a
+    reasonable connection.
+
+    Query params:
+      from      - station id (required)
+      direction - station id to filter by (required)
+      when      - ISO datetime; default: tomorrow 08:00 local
+    """
+    err = _require_cron_token()
+    if err is not None:
+        return err
+    import requests as _req
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        from zoneinfo import ZoneInfo
+        berlin = ZoneInfo("Europe/Berlin")
+    except Exception:
+        berlin = None
+
+    from_id = request.args.get("from")
+    direction_id = request.args.get("direction")
+    if not from_id or not direction_id:
+        return jsonify({"error": "Missing from or direction"}), 400
+
+    when = request.args.get("when")
+    if not when:
+        now = _dt.now(berlin) if berlin else _dt.now()
+        tmrw_8 = (now.replace(hour=8, minute=0, second=0, microsecond=0)
+                  + _td(days=1))
+        when = tmrw_8.isoformat()
+
+    params = {
+        "direction": direction_id,
+        "duration": 60,
+        "results": 100,
+        "when": when,
+        "profile": "db",
+        "remarks": "false",
+    }
+
+    try:
+        r = _req.get(
+            f"https://v6.db.transport.rest/stops/{from_id}/departures",
+            params=params,
+            headers={"User-Agent": "bahn-pb/1.0"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    deps = body.get("departures") if isinstance(body, dict) else body
+    deps = deps or []
+    simplified = []
+    products_seen: dict[str, int] = {}
+    lines_seen: dict[str, int] = {}
+    cancelled_count = 0
+    for d in deps:
+        line = d.get("line") or {}
+        p = line.get("product") or "?"
+        n = line.get("name") or "?"
+        products_seen[p] = products_seen.get(p, 0) + 1
+        lines_seen[n] = lines_seen.get(n, 0) + 1
+        if d.get("cancelled"):
+            cancelled_count += 1
+        simplified.append({
+            "line": n,
+            "product": p,
+            "direction": d.get("direction"),
+            "planned_when": d.get("plannedWhen"),
+            "when": d.get("when"),
+            "cancelled": bool(d.get("cancelled")),
+        })
+    return jsonify({
+        "when_used": when,
+        "total": len(deps),
+        "cancelled": cancelled_count,
+        "products": products_seen,
+        "lines": lines_seen,
+        "first_10": simplified[:10],
     })
 
 
