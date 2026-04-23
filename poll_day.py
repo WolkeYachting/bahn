@@ -244,11 +244,13 @@ def poll_once() -> dict:
         "days_touched": [],
     }
 
-    # 1. Fetch departures. The API silently caps 'duration' at ~60 min
-    #    regardless of what we pass, so we just ask for 60.
+    # 1. Fetch departures. The API silently caps the actual time window at
+    #    about 60-75 min regardless of 'duration', but a higher 'duration' value
+    #    does seem to unlock a larger 'results' limit internally — tests showed
+    #    duration=720 returns ~76 trips vs duration=60 returning ~9.
     try:
         departures = fetch_departures(
-            station_id, config["products"], duration_minutes=60
+            station_id, config["products"], duration_minutes=720
         )
     except Exception as e:
         stats["error"] = f"departures fetch failed: {e}"
